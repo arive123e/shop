@@ -1,71 +1,112 @@
-const puppeteer = require('puppeteer');
-const fs = require('fs');
+require('dotenv').config();
 
-async function parseTaobao(url) {
+const TelegramBot = require('node-telegram-bot-api');
+const puppeteer = require('puppeteer');
+
+const token = process.env.TELEGRAM_BOT_TOKEN;
+if (!token) {
+  console.error('❌ TELEGRAM_BOT_TOKEN не указан в .env');
+  process.exit(1);
+}
+
+const bot = new TelegramBot(token, { polling: true });
+
+// Конвертация цены из юаней в тенге
+const yuanToKZT = (yuan) => {
+  const rate = 70; // 1 юань = 70 тенге (пример)
+  return (parseFloat(yuan.replace(/[^\d.,]/g, '').replace(',', '.')) * rate).toFixed(0);
+};
+
+// Парсер 1688 (минимальный, для теста)
+async function parse1688(url) {
   const browser = await puppeteer.launch({
     args: ['--no-sandbox', '--disable-setuid-sandbox'],
-    headless: true,
   });
+  const page = await browser.newPage();
 
   try {
-    const page = await browser.newPage();
     await page.goto(url, { waitUntil: 'networkidle2' });
+    await page.waitForTimeout(3000); // даём странице догрузиться
 
-    // Сохраняем HTML для отладки
-    const html = await page.content();
-    fs.writeFileSync('taobao_debug.html', html);
-
-    // Парсим данные
+    // Получаем данные
     const data = await page.evaluate(() => {
-      // Получаем название товара
-      const title = document.querySelector('h3.tb-main-title')?.innerText.trim() || null;
+      // Название товара
+      const titleEl = document.querySelector('h1.d-title');
+      const title = titleEl ? titleEl.innerText.trim() : null;
 
-      // Получаем цену
+      // Цена (иногда может быть в span.price)
       let price = null;
-      const priceElem = document.querySelector('.tb-rmb-num');
-      if (priceElem) {
-        price = priceElem.innerText.trim();
+      const priceEl = document.querySelector('span.price');
+      if (priceEl) {
+        price = priceEl.innerText.trim();
+      } else {
+        // альтернатива — первая цена в offer-price или другой блок
+        const offerPriceEl = document.querySelector('.price-original-sku');
+        if (offerPriceEl) price = offerPriceEl.innerText.trim();
       }
 
-      // Получаем все картинки товара (миниатюры)
-      const imageNodes = document.querySelectorAll('#J_UlThumb li img');
-      const images = Array.from(imageNodes).map(img => {
+      // Картинки (собираем все из галереи)
+      const images = [];
+      const imgEls = document.querySelectorAll('.tab-trigger-content img');
+      imgEls.forEach(img => {
         let src = img.getAttribute('src') || img.getAttribute('data-src');
         if (src) {
-          // Формируем полную ссылку, если надо
           if (src.startsWith('//')) src = 'https:' + src;
-          else if (src.startsWith('/')) src = 'https://'+ window.location.host + src;
-          // Убираем размер, чтобы получить полноразмерное фото
-          src = src.replace(/_\d+x\d+\.jpg$/, '.jpg');
+          else if (!src.startsWith('http')) src = 'https://' + src;
+          images.push(src);
         }
-        return src;
-      }).filter(Boolean);
+      });
 
-      // Получаем размеры (если есть)
-      const sizeElems = document.querySelectorAll('#J_Prop tb-d-option');
-      const sizes = Array.from(sizeElems).map(el => el.innerText.trim());
-
-      return {
-        title,
-        price,
-        images,
-        sizes
-      };
+      return { title, price, images };
     });
 
-    return data;
-
-  } catch (error) {
-    console.error('Ошибка парсинга Taobao:', error);
-    return null;
-  } finally {
     await browser.close();
+
+    return data;
+  } catch (error) {
+    await browser.close();
+    throw error;
   }
 }
 
-// Пример вызова
-(async () => {
-  const url = 'https://item.taobao.com/item.htm?id=778241066598';
-  const result = await parseTaobao(url);
-  console.log(result);
-})();
+// Обработка сообщений
+bot.on('message', async (msg) => {
+  const chatId = msg.chat.id;
+
+  if (msg.text && msg.text.includes('1688.com')) {
+    bot.sendMessage(chatId, '🔎 Получаю данные с 1688... Пожалуйста, подождите.');
+
+    try {
+      const data = await parse1688(msg.text);
+
+      if (!data.title) {
+        bot.sendMessage(chatId, '❌ Не удалось получить данные с 1688. Попробуйте другую ссылку.');
+        return;
+      }
+
+      const priceKZT = data.price ? yuanToKZT(data.price) : '—';
+
+      let response = `📦 *${data.title}*\n💰 Цена: ${priceKZT} ₸ (примерно)\n\n`;
+
+      if (data.images.length) {
+        // Отправляем сначала текст
+        await bot.sendMessage(chatId, response, { parse_mode: 'Markdown' });
+
+        // Отправляем картинки группой (по 5)
+        for (let i = 0; i < data.images.length; i += 5) {
+          const media = data.images.slice(i, i + 5).map(url => ({ type: 'photo', media: url }));
+          await bot.sendMediaGroup(chatId, media);
+        }
+      } else {
+        // Нет картинок — просто отправляем текст
+        bot.sendMessage(chatId, response, { parse_mode: 'Markdown' });
+      }
+
+    } catch (error) {
+      console.error('Ошибка парсинга 1688:', error);
+      bot.sendMessage(chatId, '❌ Ошибка при получении данных. Попробуйте позже.');
+    }
+  } else {
+    bot.sendMessage(chatId, '👋 Привет! Пришли ссылку на товар с 1688.com, и я покажу подробности.');
+  }
+});
