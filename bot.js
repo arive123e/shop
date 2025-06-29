@@ -1,73 +1,83 @@
-const { TelegramClient } = require('telegram');
-const { StringSession } = require('telegram/sessions');
-const puppeteer = require('puppeteer-core');
-const input = require('input');
+import { TelegramClient } from "telegram";
+import { StringSession } from "telegram/sessions";
+import { NewMessage } from "telegram/events";
+import puppeteer from "puppeteer";
 
-const apiId = YOUR_API_ID; // вставь свои данные
-const apiHash = 'YOUR_API_HASH';
-const stringSession = new StringSession(''); // вставь сюда сессионную строку или оставь пустой для логина
+const apiId = YOUR_API_ID; // замени на свои
+const apiHash = 'YOUR_API_HASH'; // замени на свои
+const stringSession = new StringSession('YOUR_STRING_SESSION'); // если нет, создай
 
-// Вспомогательная функция для извлечения ссылки из текста
 function extractUrl(text) {
-  const match = text.match(/https?:\/\/[^\s]+/);
+  const urlRegex = /(https?:\/\/[^\s]+)/g;
+  const match = text.match(urlRegex);
   return match ? match[0] : null;
 }
 
-// Парсер 1688
 async function parse1688(url) {
+  console.log('[parse1688] Запуск парсинга URL:', url);
   const browser = await puppeteer.launch({
     args: ['--no-sandbox', '--disable-setuid-sandbox'],
-    headless: true,
-    executablePath: '/path/to/chrome', // укажи путь к хрому, если нужно
   });
-
   const page = await browser.newPage();
+
   await page.goto(url, { waitUntil: 'networkidle2' });
 
-  // Пример парсинга названия товара
-  const title = await page.$eval('title', el => el.innerText).catch(() => null);
-
-  // Тут добавь парсинг цены, изображений и размеров, например:
-  const price = await page.$eval('.price-class', el => el.innerText).catch(() => null);
-  // ... аналогично для images, sizes
+  // Пример получения данных — адаптируй под реальный сайт 1688
+  const data = await page.evaluate(() => {
+    const title = document.querySelector('h1')?.innerText || null;
+    const price = document.querySelector('.price')?.innerText || null;
+    // добавь по необходимости
+    return { title, price };
+  });
 
   await browser.close();
 
-  return { title, price, images: [], sizes: [] };
+  console.log('[parse1688] Данные с сайта:', data);
+  return data;
 }
 
 (async () => {
-  console.log('Запускаем Telegram клиента...');
   const client = new TelegramClient(stringSession, apiId, apiHash, {
     connectionRetries: 5,
   });
+
   await client.start({
-    phoneNumber: async () => await input.text('Enter your phone number:'),
-    password: async () => await input.text('Enter your password:'),
-    phoneCode: async () => await input.text('Enter the code you received:'),
+    phoneNumber: async () => await input.text("Введите номер телефона: "),
+    password: async () => await input.text("Введите пароль 2FA: "),
+    phoneCode: async () => await input.text("Введите код из SMS: "),
     onError: (err) => console.log(err),
   });
-  console.log('Клиент запущен!');
+
+  console.log('Бот запущен.');
 
   client.addEventHandler(async (event) => {
+    console.log('Получено новое событие');
     const message = event.message;
-    if (!message.message) return;
-
+    if (!message || !message.message) {
+      console.log('Нет текста в сообщении, пропуск...');
+      return;
+    }
     const rawText = message.message;
+    console.log('Текст сообщения:', rawText);
     const url = extractUrl(rawText);
+    console.log('Извлечён URL:', url);
 
     if (url && url.includes('1688.com')) {
       await client.sendMessage(message.chatId, 'Получаю данные, подожди...');
       try {
         const data = await parse1688(url);
-        await client.sendMessage(message.chatId, `Название: ${data.title || 'нет данных'}\nЦена: ${data.price || 'нет данных'}`);
-        // Можешь добавить отправку изображений и размеров здесь
+        console.log('Данные получены:', data);
+        await client.sendMessage(
+          message.chatId,
+          `Название: ${data.title || 'нет данных'}\nЦена: ${data.price || 'нет данных'}`
+        );
       } catch (e) {
+        console.log('Ошибка парсинга:', e);
         await client.sendMessage(message.chatId, 'Ошибка при парсинге 1688: ' + e.message);
       }
     } else {
+      console.log('URL не валиден или не из 1688');
       await client.sendMessage(message.chatId, 'Пожалуйста, отправь корректную ссылку с 1688.com');
     }
   }, new NewMessage({}));
-
 })();
