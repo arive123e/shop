@@ -1,42 +1,71 @@
-require('dotenv').config();
-const TelegramBot = require('node-telegram-bot-api');
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 
-const token = process.env.TELEGRAM_BOT_TOKEN || 'твой_токен_бота';
-const bot = new TelegramBot(token, { polling: true });
+async function parseTaobao(url) {
+  const browser = await puppeteer.launch({
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    headless: true,
+  });
 
-bot.on('message', async (msg) => {
-  const chatId = msg.chat.id;
+  try {
+    const page = await browser.newPage();
+    await page.goto(url, { waitUntil: 'networkidle2' });
 
-  // Проверяем наличие ссылки на taobao.com
-  if (msg.text && msg.text.includes('taobao.com')) {
-    bot.sendMessage(chatId, '⏳ Получаю информацию о товаре, подожди пару секунд...');
+    // Сохраняем HTML для отладки
+    const html = await page.content();
+    fs.writeFileSync('taobao_debug.html', html);
 
-    try {
-      // Запуск браузера
-      const browser = await puppeteer.launch({
-        headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
-      });
-      const page = await browser.newPage();
+    // Парсим данные
+    const data = await page.evaluate(() => {
+      // Получаем название товара
+      const title = document.querySelector('h3.tb-main-title')?.innerText.trim() || null;
 
-      // Открываем страницу
-      await page.goto(msg.text, { waitUntil: 'networkidle2', timeout: 60000 });
+      // Получаем цену
+      let price = null;
+      const priceElem = document.querySelector('.tb-rmb-num');
+      if (priceElem) {
+        price = priceElem.innerText.trim();
+      }
 
-      // Получаем HTML и сохраняем в файл
-      const html = await page.content();
-      fs.writeFileSync('taobao_debug.html', html, 'utf8');
-      console.log('HTML сохранён в taobao_debug.html');
+      // Получаем все картинки товара (миниатюры)
+      const imageNodes = document.querySelectorAll('#J_UlThumb li img');
+      const images = Array.from(imageNodes).map(img => {
+        let src = img.getAttribute('src') || img.getAttribute('data-src');
+        if (src) {
+          // Формируем полную ссылку, если надо
+          if (src.startsWith('//')) src = 'https:' + src;
+          else if (src.startsWith('/')) src = 'https://'+ window.location.host + src;
+          // Убираем размер, чтобы получить полноразмерное фото
+          src = src.replace(/_\d+x\d+\.jpg$/, '.jpg');
+        }
+        return src;
+      }).filter(Boolean);
 
-      await browser.close();
+      // Получаем размеры (если есть)
+      const sizeElems = document.querySelectorAll('#J_Prop tb-d-option');
+      const sizes = Array.from(sizeElems).map(el => el.innerText.trim());
 
-      bot.sendMessage(chatId, '✅ Страница сохранена! Отправь файл `taobao_debug.html` разработчику (т.е. мне 😊).');
-    } catch (error) {
-      bot.sendMessage(chatId, '❌ Не удалось получить данные. Ошибка сохранения HTML.');
-      console.error('Ошибка Puppeteer:', error.message);
-    }
-  } else {
-    bot.sendMessage(chatId, 'Привет! Пришли ссылку на товар с TaoBao, и я попробую её обработать.');
+      return {
+        title,
+        price,
+        images,
+        sizes
+      };
+    });
+
+    return data;
+
+  } catch (error) {
+    console.error('Ошибка парсинга Taobao:', error);
+    return null;
+  } finally {
+    await browser.close();
   }
-});
+}
+
+// Пример вызова
+(async () => {
+  const url = 'https://item.taobao.com/item.htm?id=778241066598';
+  const result = await parseTaobao(url);
+  console.log(result);
+})();
