@@ -1,54 +1,69 @@
 require('dotenv').config();
 
 const TelegramBot = require('node-telegram-bot-api');
-const axios = require('axios');
-const cheerio = require('cheerio');
+const puppeteer = require('puppeteer');
 
 const token = process.env.TELEGRAM_BOT_TOKEN || 'твой_токен_бота';
 const bot = new TelegramBot(token, { polling: true });
-
 const CNY_TO_KZT = 70;
 
+// Функция парсинга таобао
 async function parseTaobao(url) {
+  let browser;
   try {
-    const { data } = await axios.get(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0', // Чтобы Taobao не ругался на бота
-      },
-      timeout: 10000
+    browser = await puppeteer.launch({
+      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+      headless: true
+    });
+    const page = await browser.newPage();
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 35000 });
+
+    // Название
+    const title = await page.title();
+
+    // Цена
+    let price = await page.evaluate(() => {
+      // Поищем несколько вариантов селекторов
+      let priceSel =
+        document.querySelector('.price') ||
+        document.querySelector('[class*=Price--priceInt]') ||
+        document.querySelector('[class*=price] span');
+      return priceSel ? priceSel.textContent.replace(/[^\d.]/g, '') : null;
     });
 
-    const $ = cheerio.load(data);
+    // Фото (основная картинка товара)
+    let photo = await page.evaluate(() => {
+      // На новых страницах Taobao — большое фото обычно вот так:
+      let imgEl =
+        document.querySelector('.tb-main-pic img') ||
+        document.querySelector('img[data-src]') ||
+        document.querySelector('img');
+      let src = imgEl ? (imgEl.src || imgEl.getAttribute('data-src')) : null;
+      if (src && !src.startsWith('http')) src = 'https:' + src;
+      return src;
+    });
 
-    // Название товара (заголовок страницы)
-    let title = $('title').first().text() || 'Товар с TaoBao';
+    // Варианты (размеры, цвета и др.)
+    let sizes = await page.evaluate(() => {
+      let labelEls = Array.from(document.querySelectorAll('.tb-prop:not(.tb-hidden) .tb-prop-content a'));
+      if (labelEls.length === 0) {
+        labelEls = Array.from(document.querySelectorAll('[class*=sku] [class*=item]'));
+      }
+      return labelEls.map(el => el.innerText.trim()).filter(Boolean);
+    });
 
-    // Цена (пытаемся найти несколько вариантов)
-    let price =
-      $('[class*=price]').first().text().replace(/[^\d.]/g, '') ||
-      data.match(/"price":"([\d.]+)"/)?.[1] ||
-      null;
-
-    if (!price) price = 'Не удалось определить цену';
-
-    // Основное фото (берём первую большую картинку)
-    let photo = $('img').first().attr('src');
-    if (photo && !photo.startsWith('http')) photo = 'https:' + photo;
-
-    // Краткое описание (если есть)
-    let desc =
-      $('meta[name="description"]').attr('content') ||
-      'Описание недоступно';
+    await browser.close();
 
     return {
       title,
       priceCny: price,
       priceKzt: price && !isNaN(+price) ? Math.round(Number(price) * CNY_TO_KZT) : '-',
       photo,
-      desc
+      sizes
     };
   } catch (e) {
-    console.error('Ошибка парсинга TaoBao:', e.message);
+    if (browser) await browser.close();
+    console.error('Ошибка Puppeteer:', e.message);
     return null;
   }
 }
@@ -56,21 +71,23 @@ async function parseTaobao(url) {
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   if (msg.text && msg.text.includes('taobao.com')) {
-    bot.sendMessage(chatId, '⏳ Ищу информацию о товаре, подожди пару секунд...');
+    bot.sendMessage(chatId, '⏳ Получаю информацию о товаре, подожди пару секунд...');
     const data = await parseTaobao(msg.text);
-
     if (!data) {
-      bot.sendMessage(chatId, '❌ Не удалось получить данные. Возможно, ссылка нерабочая или TaoBao временно недоступен.');
+      bot.sendMessage(chatId, '❌ Не удалось получить данные. Возможно, ссылка нерабочая или Taobao временно недоступен.');
       return;
     }
+    let sizes = data.sizes && data.sizes.length
+      ? `\n\n<b>Варианты:</b> ${data.sizes.join(', ')}`
+      : '';
+    let message = `📦 <b>${data.title}</b>\n\n<b>Цена:</b> ${data.priceCny} ¥ (~${data.priceKzt} ₸)${sizes}`;
 
-    let text = `🛒 <b>${data.title}</b>\n\n💰 Цена: ${data.priceCny} ¥ (~${data.priceKzt} ₸)\n\n${data.desc}`;
     if (data.photo) {
-      bot.sendPhoto(chatId, data.photo, { caption: text, parse_mode: "HTML" });
+      bot.sendPhoto(chatId, data.photo, { caption: message, parse_mode: 'HTML' });
     } else {
-      bot.sendMessage(chatId, text, { parse_mode: "HTML" });
+      bot.sendMessage(chatId, message, { parse_mode: 'HTML' });
     }
   } else {
-    bot.sendMessage(chatId, 'Привет! Пришли ссылку на товар с TaoBao, и я покажу подробности.');
+    bot.sendMessage(chatId, '👋 Пришли ссылку на товар с TaoBao, и я покажу подробности.');
   }
 });
